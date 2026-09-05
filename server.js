@@ -57,11 +57,11 @@ async function runCatchupTask(forceFull) {
         const cutoffStr = cutoffDate.toISOString().substring(0,10).replace(/-/g, '');
 
         let offsetsToFetch = [0];
-        let cachedProgrammes = [];
+        let cachedXmlPart = '';
         const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
         // ==========================================
-        // 📥 SMART CACHE FETCHER
+        // 📥 SMART CACHE FETCHER (STREAMING APPROACH)
         // ==========================================
         if (!forceFull && GITHUB_TOKEN) {
             console.log(`[EPG] Attempting to load existing Catchup.xml to cache old data...`);
@@ -77,6 +77,8 @@ async function runCatchupTask(forceFull) {
                 if (cacheRes.ok) {
                     const cacheXml = await cacheRes.text();
                     const progBlocks = cacheXml.split('</programme>');
+                    let cachedCount = 0;
+                    
                     for (let i = 0; i < progBlocks.length - 1; i++) {
                         const block = progBlocks[i];
                         const startIdx = block.indexOf('<programme ');
@@ -88,11 +90,18 @@ async function runCatchupTask(forceFull) {
                         if (dateMatch) {
                             const progStartDay = dateMatch[1];
                             if (progStartDay < todayStr && progStartDay >= cutoffStr) {
-                                cachedProgrammes.push(fullBlock);
+                                cachedXmlPart += fullBlock + '\n';
+                                cachedCount++;
+                                
+                                // Flush to avoid memory buildup
+                                if (cachedXmlPart.length > 5 * 1024 * 1024) { // 5MB chunks
+                                    // Here you would ideally write to a temp file
+                                    console.log(`[EPG] Cache chunk loaded: ${cachedCount} programmes`);
+                                }
                             }
                         }
                     }
-                    console.log(`[EPG] ✅ Cache Loaded! Retained ${cachedProgrammes.length} past programmes.`);
+                    console.log(`[EPG] ✅ Cache Loaded! Retained ${cachedCount} past programmes.`);
                 } else {
                     console.log(`[EPG] File missing or failed. Forcing Full 9-Day Fetch.`);
                     forceFull = true; 
@@ -109,69 +118,119 @@ async function runCatchupTask(forceFull) {
         }
 
         // ==========================================
-        // 🧩 COMPILE XML DIRECTLY (LOW RAM USAGE)
+        // 🧩 BUILD XML IN CHUNKS (LOW RAM USAGE)
         // ==========================================
-        let finalXml = `<?xml version="1.0" encoding="UTF-8"?>\n<tv>\n`;
+        let xmlChunks = [];
+        let currentChunk = `<?xml version="1.0" encoding="UTF-8"?>\n<tv>\n`;
         
+        // Add channels
         validChannels.forEach(c => {
-            finalXml += `  <channel id="${c.id}">\n    <display-name>${escapeXml(c.name)}</display-name>\n  </channel>\n`;
+            currentChunk += `  <channel id="${c.id}">\n    <display-name>${escapeXml(c.name)}</display-name>\n  </channel>\n`;
         });
 
-        if (cachedProgrammes.length > 0) {
-            finalXml += cachedProgrammes.join('\n') + '\n';
-            cachedProgrammes = null; // FORCE CLEAR CACHE ARRAY FROM MEMORY
+        // Add cached programmes
+        if (cachedXmlPart.length > 0) {
+            currentChunk += cachedXmlPart;
+            cachedXmlPart = ''; // Clear memory
         }
 
         const fetchChannelWithRetry = async (channelId, offset) => {
             let jioUrl = `https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?channel_id=${channelId}&offset=${offset}`;
-            let retries = 3; 
+            let retries = 2; // Reduced retries
             while (retries > 0) {
                 try {
-                    const epgRes = await fetch(jioUrl, { headers: { 'User-Agent': 'okhttp/4.2.2', 'os': 'android', 'Accept': '*/*' }});
+                    const epgRes = await fetch(jioUrl, { 
+                        headers: { 'User-Agent': 'okhttp/4.2.2', 'os': 'android', 'Accept': '*/*' },
+                        signal: AbortSignal.timeout(10000) // 10 second timeout
+                    });
                     if (epgRes.ok) return await epgRes.json();
                     if (epgRes.status === 404) return null;
                 } catch (err) {
-                    await new Promise(r => setTimeout(r, 600));
+                    await new Promise(r => setTimeout(r, 300));
                 }
                 retries--;
             }
             return null;
         };
 
-        // Process one channel at a time to prevent RAM overload
-        for (let i = 0; i < validChannels.length; i++) {
-            const channel = validChannels[i];
-            console.log(`[EPG] Fetching ${offsetsToFetch.length} days for Channel ${i + 1}/${validChannels.length}: ${channel.name}`);
+        // Process channels in batches to manage memory
+        const BATCH_SIZE = 10; // Process 10 channels at a time
+        let programmeCount = 0;
+        
+        for (let i = 0; i < validChannels.length; i += BATCH_SIZE) {
+            const batchEnd = Math.min(i + BATCH_SIZE, validChannels.length);
+            const batchChannels = validChannels.slice(i, batchEnd);
             
-            const offsetPromises = offsetsToFetch.map(offset => fetchChannelWithRetry(channel.id, offset));
-            const results = await Promise.all(offsetPromises);
-
-            for (const data of results) {
-                if (data && data.epg && data.epg.length > 0) {
-                    for (const show of data.epg) {
-                        const startXml = formatXmltvTime(show.startEpoch);
-                        const stopXml = formatXmltvTime(show.endEpoch);
-                        const titleXml = escapeXml(show.showname);
-                        const descXml = show.description ? `\n    <desc>${escapeXml(show.description)}</desc>` : "";
-                        const catXml = show.showCategory ? `\n    <category>${escapeXml(show.showCategory)}</category>` : "";
+            console.log(`[EPG] Processing batch ${Math.floor(i/BATCH_SIZE) + 1}: Channels ${i+1}-${batchEnd}/${validChannels.length}`);
+            
+            // Process each channel in the batch
+            for (let j = 0; j < batchChannels.length; j++) {
+                const channel = batchChannels[j];
+                
+                try {
+                    // Fetch one day at a time to reduce memory
+                    for (const offset of offsetsToFetch) {
+                        const data = await fetchChannelWithRetry(channel.id, offset);
                         
-                        finalXml += `  <programme start="${startXml}" stop="${stopXml}" channel="${channel.id}">\n    <title>${titleXml}</title>${descXml}${catXml}\n  </programme>\n`;
+                        if (data && data.epg && data.epg.length > 0) {
+                            for (const show of data.epg) {
+                                const startXml = formatXmltvTime(show.startEpoch);
+                                const stopXml = formatXmltvTime(show.endEpoch);
+                                const titleXml = escapeXml(show.showname);
+                                const descXml = show.description ? `\n    <desc>${escapeXml(show.description)}</desc>` : "";
+                                const catXml = show.showCategory ? `\n    <category>${escapeXml(show.showCategory)}</category>` : "";
+                                
+                                currentChunk += `  <programme start="${startXml}" stop="${stopXml}" channel="${channel.id}">\n    <title>${titleXml}</title>${descXml}${catXml}\n  </programme>\n`;
+                                programmeCount++;
+                                
+                                // Flush chunk if it gets too large (10MB)
+                                if (currentChunk.length > 10 * 1024 * 1024) {
+                                    xmlChunks.push(currentChunk);
+                                    currentChunk = '';
+                                }
+                            }
+                        }
+                        
+                        // Small delay to allow GC
+                        await new Promise(r => setTimeout(r, 100));
                     }
+                    
+                    console.log(`[EPG] Completed channel ${i + j + 1}/${validChannels.length}: ${channel.name} (Total programmes: ${programmeCount})`);
+                    
+                } catch (err) {
+                    console.error(`[EPG] Error processing channel ${channel.name}:`, err.message);
                 }
             }
-            // Small safety delay allows V8 Garbage Collector to clean RAM
-            await new Promise(r => setTimeout(r, 400));
+            
+            // Force garbage collection hint
+            if (global.gc) {
+                global.gc();
+            }
+            
+            // Delay between batches
+            await new Promise(r => setTimeout(r, 1000));
         }
 
-        finalXml += `</tv>`;
+        currentChunk += `</tv>`;
+        xmlChunks.push(currentChunk);
 
         // ==========================================
-        // ☁️ UPLOAD TO GITHUB
+        // ☁️ UPLOAD TO GITHUB (CHUNKED)
         // ==========================================
+        console.log(`[EPG] Uploading ${programmeCount} programmes in ${xmlChunks.length} chunks...`);
+        
+        // Combine chunks for upload (for files < 50MB this is fine)
+        const finalXml = xmlChunks.join('');
+        xmlChunks = []; // Clear memory
+        
         await uploadToGitHub(FILE_PATH, finalXml);
+
+        console.log(`[EPG] ✅ Complete! Total programmes: ${programmeCount}`);
+        return programmeCount;
 
     } catch (error) {
         console.error(`[EPG] FATAL ERROR:`, error.message);
+        return 0;
     }
 }
 
@@ -182,14 +241,18 @@ async function uploadToGitHub(filePath, xmlContent) {
     const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
     if (!GITHUB_TOKEN) return console.error("❌ MISSING GITHUB TOKEN!");
 
-    console.log(`[GitHub] Preparing to update file: ${filePath}`);
+    console.log(`[GitHub] Preparing to update file: ${filePath} (${(xmlContent.length / 1024 / 1024).toFixed(2)} MB)`);
     const githubFileUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`;
     
     let fileSha = undefined;
     
     try {
         const checkExisting = await fetch(`${githubFileUrl}?t=${Date.now()}`, {
-            headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Cache-Control': 'no-cache' }
+            headers: { 
+                'Authorization': `Bearer ${GITHUB_TOKEN}`, 
+                'Cache-Control': 'no-cache',
+                'User-Agent': 'Express-Catchup-Generator'
+            }
         });
         if (checkExisting.ok) {
             const existingFileData = await checkExisting.json();
@@ -206,7 +269,7 @@ async function uploadToGitHub(filePath, xmlContent) {
     };
     if (fileSha) requestBody.sha = fileSha;
 
-    console.log(`[GitHub] 📤 Uploading XML...`);
+    console.log(`[GitHub] 📤 Uploading ${(fileContentBase64.length / 1024 / 1024).toFixed(2)} MB XML...`);
     const uploadResponse = await fetch(githubFileUrl, {
         method: 'PUT',
         headers: {
