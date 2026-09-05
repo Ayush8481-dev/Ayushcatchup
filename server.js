@@ -5,9 +5,9 @@ const PORT = process.env.PORT || 3000;
 // ==========================================
 // ⚙️ GITHUB CONFIGURATION
 // ==========================================
-const GITHUB_OWNER = "Ayush8481-dev"; // <--- CHANGE THIS IF NEEDED
-const GITHUB_REPO = "Epgdata";        // <--- CHANGE THIS IF NEEDED
-const FILE_PATH = "Catchup.xml";      // Uploaded to root directory
+const GITHUB_OWNER = "Ayush8481-dev"; 
+const GITHUB_REPO = "Epgdata";        
+const FILE_PATH = "Catchup.xml";      
 
 // High-speed Native String replace for XML (Escape)
 const escapeMap = { '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' };
@@ -25,14 +25,12 @@ const formatXmltvTime = (epoch) => {
 // ==========================================
 // 🚀 API ENDPOINT - GENERATOR
 // ==========================================
-// Trigger normally for daily smart update (Offset 0). 
-// Use ?full=true to manually force a fresh 9-day fetch of all offsets.
 app.get('/generate', async (req, res) => {
     const trigger = req.query.trigger === 'true';
     const forceFull = req.query.full === 'true';
 
     if (trigger) {
-        res.status(200).json({ success: true, message: `Worker started in background. Full Fetch: ${forceFull}` });
+        res.status(200).json({ success: true, message: `Worker started. Memory-Optimized mode active. Full Fetch: ${forceFull}` });
         runCatchupTask(forceFull); 
     } else {
         await runCatchupTask(forceFull);
@@ -41,7 +39,7 @@ app.get('/generate', async (req, res) => {
 });
 
 // ==========================================
-// 🛠️ CATCHUP EPG GENERATOR TASK
+// 🛠️ MEMORY-OPTIMIZED GENERATOR TASK
 // ==========================================
 async function runCatchupTask(forceFull) {
     try {
@@ -49,16 +47,12 @@ async function runCatchupTask(forceFull) {
         const chReq = await fetch("https://raw.githubusercontent.com/Ayush8481Lab/Mm/refs/heads/main/AyushCatchup.json");
         const channelsData = await chReq.json();
         
-        // Ensure channels have an ID
         const validChannels = channelsData.filter(c => c.id);
         if (validChannels.length === 0) return console.log(`[EPG] No valid channels found.`);
 
-        // Time logic setup (IST)
         const now = new Date();
         const istTime = new Date(now.getTime() + 19800000); 
-        const todayStr = istTime.toISOString().substring(0,10).replace(/-/g, ''); // e.g. "20231025"
-        
-        // 8 Days ago boundary
+        const todayStr = istTime.toISOString().substring(0,10).replace(/-/g, ''); 
         const cutoffDate = new Date(istTime.getTime() - (8 * 86400000));
         const cutoffStr = cutoffDate.toISOString().substring(0,10).replace(/-/g, '');
 
@@ -75,15 +69,13 @@ async function runCatchupTask(forceFull) {
                 const cacheRes = await fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${FILE_PATH}`, {
                     headers: { 
                         'Authorization': `Bearer ${GITHUB_TOKEN}`,
-                        'Accept': 'application/vnd.github.v3.raw', // Directly get raw decoded text
+                        'Accept': 'application/vnd.github.v3.raw',
                         'Cache-Control': 'no-cache'
                     }
                 });
 
                 if (cacheRes.ok) {
                     const cacheXml = await cacheRes.text();
-                    
-                    // High-speed string split to parse old programmes without regex freezing
                     const progBlocks = cacheXml.split('</programme>');
                     for (let i = 0; i < progBlocks.length - 1; i++) {
                         const block = progBlocks[i];
@@ -95,7 +87,6 @@ async function runCatchupTask(forceFull) {
                         
                         if (dateMatch) {
                             const progStartDay = dateMatch[1];
-                            // Keep programme if it is older than today, but newer or equal to 8 days ago
                             if (progStartDay < todayStr && progStartDay >= cutoffStr) {
                                 cachedProgrammes.push(fullBlock);
                             }
@@ -103,7 +94,7 @@ async function runCatchupTask(forceFull) {
                     }
                     console.log(`[EPG] ✅ Cache Loaded! Retained ${cachedProgrammes.length} past programmes.`);
                 } else {
-                    console.log(`[EPG] No existing Catchup file found or failed. Forcing Full 9-Day Fetch.`);
+                    console.log(`[EPG] File missing or failed. Forcing Full 9-Day Fetch.`);
                     forceFull = true; 
                 }
             } catch (err) {
@@ -112,19 +103,25 @@ async function runCatchupTask(forceFull) {
             }
         }
 
-        // Apply offsets based on scenario
         if (forceFull) {
             offsetsToFetch = [0, -1, -2, -3, -4, -5, -6, -7, -8];
             console.log(`[EPG] Proceeding with FULL FETCH of 9 Days (Offsets: 0 to -8)`);
-        } else {
-            console.log(`[EPG] Proceeding with DAILY FETCH (Offset: 0 only)`);
         }
 
         // ==========================================
-        // 🔄 FETCH NEW DATA (WITH BATCHING)
+        // 🧩 COMPILE XML DIRECTLY (LOW RAM USAGE)
         // ==========================================
-        const newProgrammes = [];
+        let finalXml = `<?xml version="1.0" encoding="UTF-8"?>\n<tv>\n`;
         
+        validChannels.forEach(c => {
+            finalXml += `  <channel id="${c.id}">\n    <display-name>${escapeXml(c.name)}</display-name>\n  </channel>\n`;
+        });
+
+        if (cachedProgrammes.length > 0) {
+            finalXml += cachedProgrammes.join('\n') + '\n';
+            cachedProgrammes = null; // FORCE CLEAR CACHE ARRAY FROM MEMORY
+        }
+
         const fetchChannelWithRetry = async (channelId, offset) => {
             let jioUrl = `https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?channel_id=${channelId}&offset=${offset}`;
             let retries = 3; 
@@ -141,47 +138,32 @@ async function runCatchupTask(forceFull) {
             return null;
         };
 
-        // Batch requests to prevent overwhelming JioTV API
-        const batchSize = 15; 
-        for (let i = 0; i < validChannels.length; i += batchSize) {
-            const batch = validChannels.slice(i, i + batchSize);
-            console.log(`[EPG] Processing channels ${i + 1} to ${Math.min(i + batchSize, validChannels.length)}...`);
+        // Process one channel at a time to prevent RAM overload
+        for (let i = 0; i < validChannels.length; i++) {
+            const channel = validChannels[i];
+            console.log(`[EPG] Fetching ${offsetsToFetch.length} days for Channel ${i + 1}/${validChannels.length}: ${channel.name}`);
             
-            const promises = batch.map(async (channel) => {
-                const channelDataLines = [];
-                for (const offset of offsetsToFetch) {
-                    const data = await fetchChannelWithRetry(channel.id, offset);
-                    if (data && data.epg && data.epg.length > 0) {
-                        for (const show of data.epg) {
-                            const startXml = formatXmltvTime(show.startEpoch);
-                            const stopXml = formatXmltvTime(show.endEpoch);
-                            const titleXml = escapeXml(show.showname);
-                            const descXml = show.description ? `\n    <desc>${escapeXml(show.description)}</desc>` : "";
-                            const catXml = show.showCategory ? `\n    <category>${escapeXml(show.showCategory)}</category>` : "";
-                            
-                            channelDataLines.push(`  <programme start="${startXml}" stop="${stopXml}" channel="${channel.id}">\n    <title>${titleXml}</title>${descXml}${catXml}\n  </programme>`);
-                        }
+            const offsetPromises = offsetsToFetch.map(offset => fetchChannelWithRetry(channel.id, offset));
+            const results = await Promise.all(offsetPromises);
+
+            for (const data of results) {
+                if (data && data.epg && data.epg.length > 0) {
+                    for (const show of data.epg) {
+                        const startXml = formatXmltvTime(show.startEpoch);
+                        const stopXml = formatXmltvTime(show.endEpoch);
+                        const titleXml = escapeXml(show.showname);
+                        const descXml = show.description ? `\n    <desc>${escapeXml(show.description)}</desc>` : "";
+                        const catXml = show.showCategory ? `\n    <category>${escapeXml(show.showCategory)}</category>` : "";
+                        
+                        finalXml += `  <programme start="${startXml}" stop="${stopXml}" channel="${channel.id}">\n    <title>${titleXml}</title>${descXml}${catXml}\n  </programme>\n`;
                     }
                 }
-                return channelDataLines;
-            });
-
-            const results = await Promise.all(promises);
-            results.flat().forEach(p => newProgrammes.push(p));
-            await new Promise(r => setTimeout(r, 1000)); // 1s safety cooldown between batches
+            }
+            // Small safety delay allows V8 Garbage Collector to clean RAM
+            await new Promise(r => setTimeout(r, 400));
         }
 
-        // ==========================================
-        // 🧩 MERGE & COMPILE XML
-        // ==========================================
-        const channelXmlBlocks = validChannels.map(c => `  <channel id="${c.id}">\n    <display-name>${escapeXml(c.name)}</display-name>\n  </channel>`);
-
-        const finalXml = `<?xml version="1.0" encoding="UTF-8"?>\n<tv>\n` + 
-                         channelXmlBlocks.join('\n') + '\n' + 
-                         cachedProgrammes.join('\n') + 
-                         (cachedProgrammes.length > 0 ? '\n' : '') + 
-                         newProgrammes.join('\n') + 
-                         `\n</tv>`;
+        finalXml += `</tv>`;
 
         // ==========================================
         // ☁️ UPLOAD TO GITHUB
@@ -205,7 +187,6 @@ async function uploadToGitHub(filePath, xmlContent) {
     
     let fileSha = undefined;
     
-    // Step 1: Check for existing file SHA to overwrite it directly (Prevents needing DELETE first)
     try {
         const checkExisting = await fetch(`${githubFileUrl}?t=${Date.now()}`, {
             headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Cache-Control': 'no-cache' }
@@ -223,7 +204,7 @@ async function uploadToGitHub(filePath, xmlContent) {
         message: `Daily Catchup EPG Update (${new Date().toISOString().substring(0, 10)})`,
         content: fileContentBase64
     };
-    if (fileSha) requestBody.sha = fileSha; // Providing SHA overwrites existing file
+    if (fileSha) requestBody.sha = fileSha;
 
     console.log(`[GitHub] 📤 Uploading XML...`);
     const uploadResponse = await fetch(githubFileUrl, {
