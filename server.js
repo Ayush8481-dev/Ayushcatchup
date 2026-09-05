@@ -95,7 +95,7 @@ async function runCatchupTask(forceFull) {
                 });
 
                 if (cacheRes.ok) {
-                    const cacheXml = await cacheRes.text();
+                    let cacheXml = await cacheRes.text();
                     const progBlocks = cacheXml.split('</programme>');
                     let cachedCount = 0;
                     
@@ -222,7 +222,7 @@ async function runCatchupTask(forceFull) {
 }
 
 // ==========================================
-// ☁️ UPLOAD FILE IN PARTS
+// ☁️ UPLOAD FILE IN PARTS (FIXED)
 // ==========================================
 async function uploadFileInParts(filePath, token) {
     if (!token) {
@@ -242,12 +242,11 @@ async function uploadFileInParts(filePath, token) {
     try {
         // Read the entire file in chunks and upload each part
         const fileBuffer = fs.readFileSync(filePath);
-        const parts = [];
         
         for (let i = 0; i < totalParts; i++) {
             const start = i * PART_SIZE;
             const end = Math.min(start + PART_SIZE, fileSize);
-            const partBuffer = fileBuffer.subarray(start, end);
+            let partBuffer = fileBuffer.subarray(start, end); // Changed to let
             
             // Upload each part as a separate file
             const partFileName = `${FILE_PATH}.part${String(i + 1).padStart(3, '0')}`;
@@ -256,11 +255,12 @@ async function uploadFileInParts(filePath, token) {
             console.log(`[GitHub] Uploading part ${i + 1}/${totalParts} (${(partBuffer.length / 1024 / 1024).toFixed(2)} MB)...`);
             
             const uploadResult = await uploadSingleFile(partFileName, partContent, token);
+            
             if (uploadResult) {
-                parts.push({
-                    name: partFileName,
-                    sha: uploadResult.sha
-                });
+                console.log(`✅ Part ${i + 1} uploaded successfully`);
+            } else {
+                console.error(`❌ Failed to upload part ${i + 1}`);
+                break; // Stop if a part fails
             }
             
             // Clear references
