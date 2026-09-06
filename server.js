@@ -93,7 +93,7 @@ async function runGenerateTask(offset) {
         const validChannels = channelsData.filter(c => c.id);
         if (validChannels.length === 0) {
             console.log(`[EPG] No valid channels found.`);
-            return;
+            return false;
         }
 
         console.log(`[EPG] Generating Day ${Math.abs(offset)} Catchup.xml (Offset: ${offset})`);
@@ -232,7 +232,7 @@ async function runGenerateTask(offset) {
 }
 
 // ==========================================
-// 🔄 UPDATE TASK - ROTATE DAYS (FIXED ORDER)
+// 🔄 UPDATE TASK - ROTATE DAYS (LOCAL DOWNLOAD/UPLOAD METHOD)
 // ==========================================
 async function runUpdateTask() {
     const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -241,38 +241,89 @@ async function runUpdateTask() {
         return;
     }
     
+    const tempDir = '/tmp/epg_rotation';
+    
     try {
         console.log(`[UPDATE] ========================================`);
         console.log(`[UPDATE] Starting day rotation...`);
         console.log(`[UPDATE] ========================================`);
         
-        // Step 1: Delete Day 9 file (oldest)
-        console.log(`[UPDATE] Step 1: Deleting Day9${FILE_SUFFIX}...`);
-        await deleteFileFromGitHub(`Day9${FILE_SUFFIX}`, GITHUB_TOKEN);
+        // Create temp directory for rotation
+        if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+        }
         
-        // Step 2: Rename Day 8 to Day 9, Day 7 to Day 8, ..., Day 0 to Day 1
-        console.log(`[UPDATE] Step 2: Rotating files...`);
-        for (let i = 8; i >= 0; i--) {
-            const oldName = `Day${i}${FILE_SUFFIX}`;
-            const newName = `Day${i + 1}${FILE_SUFFIX}`;
+        // Step 1: Download all existing files (Day 0 to Day 8)
+        console.log(`[UPDATE] Step 1: Downloading existing files (Day 0-8)...`);
+        const downloadedFiles = [];
+        
+        for (let i = 0; i <= 8; i++) {
+            const fileName = `Day${i}${FILE_SUFFIX}`;
+            const localPath = path.join(tempDir, fileName);
             
-            console.log(`[UPDATE] Renaming ${oldName} to ${newName}...`);
-            await renameFileOnGitHub(oldName, newName, GITHUB_TOKEN);
+            const success = await downloadFileFromGitHub(fileName, localPath, GITHUB_TOKEN);
+            if (success) {
+                const fileSize = fs.statSync(localPath).size;
+                downloadedFiles.push({ day: i, fileName, localPath, size: fileSize });
+                console.log(`[UPDATE] Downloaded ${fileName} (${(fileSize / 1024 / 1024).toFixed(2)} MB)`);
+            } else {
+                console.log(`[UPDATE] ${fileName} not found, skipping.`);
+            }
             
             // Small delay to avoid rate limiting
             await new Promise(r => setTimeout(r, 500));
         }
         
-        // Step 3: Generate and upload Day 0 (current day)
-        console.log(`[UPDATE] Step 3: Generating Day 0 (current day)...`);
+        console.log(`[UPDATE] Downloaded ${downloadedFiles.length} files.`);
+        
+        // Step 2: Delete all Day files from GitHub (Day 0 to Day 9)
+        console.log(`[UPDATE] Step 2: Deleting all Day files from GitHub...`);
+        for (let i = 0; i <= 9; i++) {
+            const fileName = `Day${i}${FILE_SUFFIX}`;
+            await deleteFileFromGitHub(fileName, GITHUB_TOKEN);
+            await new Promise(r => setTimeout(r, 300));
+        }
+        console.log(`[UPDATE] All Day files deleted from GitHub.`);
+        
+        // Step 3: Upload rotated files (Day 0 becomes Day 1, Day 1 becomes Day 2, etc.)
+        console.log(`[UPDATE] Step 3: Uploading rotated files (Day 1-9)...`);
+        for (const fileInfo of downloadedFiles) {
+            const oldDay = fileInfo.day;
+            const newDay = oldDay + 1;
+            const newFileName = `Day${newDay}${FILE_SUFFIX}`;
+            
+            console.log(`[UPDATE] Uploading ${fileInfo.fileName} as ${newFileName}...`);
+            await uploadFileToGitHub(fileInfo.localPath, newFileName, GITHUB_TOKEN);
+            
+            // Clean up local file
+            fs.unlinkSync(fileInfo.localPath);
+            
+            // Small delay to avoid rate limiting
+            await new Promise(r => setTimeout(r, 500));
+        }
+        
+        console.log(`[UPDATE] Rotated files uploaded successfully.`);
+        
+        // Step 4: Generate and upload new Day 0
+        console.log(`[UPDATE] Step 4: Generating new Day 0...`);
         await runGenerateTask(0);
         
         console.log(`[UPDATE] ========================================`);
         console.log(`[UPDATE] ✅ Day rotation completed successfully!`);
         console.log(`[UPDATE] ========================================`);
         
+        // Clean up temp directory
+        if (fs.existsSync(tempDir)) {
+            fs.rmdirSync(tempDir, { recursive: true });
+        }
+        
     } catch (error) {
         console.error(`[UPDATE] Error during rotation:`, error.message);
+        
+        // Clean up temp directory on error
+        if (fs.existsSync(tempDir)) {
+            fs.rmdirSync(tempDir, { recursive: true });
+        }
     }
 }
 
@@ -318,33 +369,10 @@ async function uploadFileToGitHub(filePath, fileName, token) {
         
         const githubFileUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${fileName}`;
         
-        // Check if file exists
-        let fileSha = undefined;
-        try {
-            const checkExisting = await fetch(githubFileUrl, {
-                headers: { 
-                    'Authorization': `Bearer ${token}`,
-                    'Cache-Control': 'no-cache',
-                    'User-Agent': 'Express-Catchup-Generator'
-                }
-            });
-            
-            if (checkExisting.ok) {
-                const existingFileData = await checkExisting.json();
-                fileSha = existingFileData.sha;
-            }
-        } catch (e) {
-            // File doesn't exist, create new
-        }
-        
         const requestBody = {
             message: `Update ${fileName} (${new Date().toISOString().substring(0, 10)})`,
             content: base64Content
         };
-        
-        if (fileSha) {
-            requestBody.sha = fileSha;
-        }
         
         const uploadResponse = await fetch(githubFileUrl, {
             method: 'PUT',
@@ -357,7 +385,8 @@ async function uploadFileToGitHub(filePath, fileName, token) {
         });
         
         if (uploadResponse.ok) {
-            console.log(`✅ Successfully uploaded ${fileName}`);
+            const responseData = await uploadResponse.json();
+            console.log(`✅ Successfully uploaded ${fileName} (Size: ${(responseData.content.size / 1024 / 1024).toFixed(2)} MB)`);
             return true;
         } else {
             const errorData = await uploadResponse.json();
@@ -367,6 +396,43 @@ async function uploadFileToGitHub(filePath, fileName, token) {
         
     } catch (error) {
         console.error(`❌ Error uploading ${fileName}:`, error.message);
+        return false;
+    }
+}
+
+// ==========================================
+// 📥 DOWNLOAD FILE FROM GITHUB
+// ==========================================
+async function downloadFileFromGitHub(fileName, localPath, token) {
+    try {
+        const rawUrl = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/main/${fileName}`;
+        
+        const downloadRes = await fetch(rawUrl, {
+            headers: { 
+                'Authorization': `Bearer ${token}`,
+                'Cache-Control': 'no-cache',
+                'User-Agent': 'Express-Catchup-Generator'
+            }
+        });
+        
+        if (!downloadRes.ok) {
+            return false;
+        }
+        
+        const contentText = await downloadRes.text();
+        
+        if (!contentText || contentText.length === 0) {
+            console.error(`[Download] File ${fileName} is empty!`);
+            return false;
+        }
+        
+        // Write to local file
+        fs.writeFileSync(localPath, contentText, 'utf-8');
+        
+        return true;
+        
+    } catch (error) {
+        console.error(`[Download] Error downloading ${fileName}:`, error.message);
         return false;
     }
 }
@@ -412,110 +478,13 @@ async function deleteFileFromGitHub(fileName, token) {
             console.log(`✅ Successfully deleted ${fileName}`);
             return true;
         } else {
-            console.error(`❌ Failed to delete ${fileName}`);
+            const errorData = await deleteResponse.json();
+            console.error(`❌ Failed to delete ${fileName}:`, errorData.message);
             return false;
         }
         
     } catch (error) {
         console.error(`❌ Error deleting ${fileName}:`, error.message);
-        return false;
-    }
-}
-
-// ==========================================
-// 📝 RENAME FILE ON GITHUB
-// ==========================================
-async function renameFileOnGitHub(oldName, newName, token) {
-    try {
-        // Download old file content
-        const downloadUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${oldName}`;
-        const downloadRes = await fetch(downloadUrl, {
-            headers: { 
-                'Authorization': `Bearer ${token}`,
-                'Cache-Control': 'no-cache',
-                'User-Agent': 'Express-Catchup-Generator'
-            }
-        });
-        
-        if (!downloadRes.ok) {
-            console.log(`[GitHub] File ${oldName} not found, skipping rename.`);
-            return false;
-        }
-        
-        const fileData = await downloadRes.json();
-        const content = fileData.content; // Already base64 encoded
-        
-        // Create new file with old content
-        const createUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${newName}`;
-        
-        // Check if new file already exists
-        let newFileSha = undefined;
-        try {
-            const checkNew = await fetch(createUrl, {
-                headers: { 
-                    'Authorization': `Bearer ${token}`,
-                    'Cache-Control': 'no-cache',
-                    'User-Agent': 'Express-Catchup-Generator'
-                }
-            });
-            
-            if (checkNew.ok) {
-                const newFileData = await checkNew.json();
-                newFileSha = newFileData.sha;
-            }
-        } catch (e) {
-            // New file doesn't exist
-        }
-        
-        const createBody = {
-            message: `Rename ${oldName} to ${newName}`,
-            content: content
-        };
-        
-        if (newFileSha) {
-            createBody.sha = newFileSha;
-        }
-        
-        const createRes = await fetch(createUrl, {
-            method: 'PUT',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Express-Catchup-Generator'
-            },
-            body: JSON.stringify(createBody)
-        });
-        
-        if (!createRes.ok) {
-            console.error(`❌ Failed to create ${newName} during rename`);
-            return false;
-        }
-        
-        // Delete old file
-        const deleteUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${oldName}`;
-        const deleteRes = await fetch(deleteUrl, {
-            method: 'DELETE',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Express-Catchup-Generator'
-            },
-            body: JSON.stringify({
-                message: `Delete ${oldName} after rename to ${newName}`,
-                sha: fileData.sha
-            })
-        });
-        
-        if (deleteRes.ok) {
-            console.log(`✅ Successfully renamed ${oldName} to ${newName}`);
-            return true;
-        } else {
-            console.error(`❌ Failed to delete ${oldName} after creating ${newName}`);
-            return false;
-        }
-        
-    } catch (error) {
-        console.error(`❌ Error renaming ${oldName}:`, error.message);
         return false;
     }
 }
