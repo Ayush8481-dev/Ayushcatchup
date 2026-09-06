@@ -9,7 +9,8 @@ const PORT = process.env.PORT || 3000;
 // ==========================================
 const GITHUB_OWNER = "Ayush8481-dev"; 
 const GITHUB_REPO = "Epgdata";        
-const FILE_PATH = "Catchup.xml";      
+const FILE_PREFIX = "Day";             
+const FILE_SUFFIX = "Catchup.xml";     
 
 // High-speed Native String replace for XML (Escape)
 const escapeMap = { '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' };
@@ -25,27 +26,53 @@ const formatXmltvTime = (epoch) => {
 };
 
 // ==========================================
-// 🚀 API ENDPOINT - GENERATOR
+// 🚀 API ENDPOINT - GENERATE SPECIFIC DAY OFFSET
 // ==========================================
 app.get('/generate', async (req, res) => {
     const trigger = req.query.trigger === 'true';
-    const forceFull = req.query.full === 'true';
+    const updateMode = req.query.update === 'true';
+    const offsetParam = req.query.id;
+
+    // Parse offset (default to 0 if not provided or invalid)
+    let offset = 0;
+    if (offsetParam !== undefined && offsetParam !== null) {
+        offset = parseInt(offsetParam);
+        if (isNaN(offset) || offset < -9 || offset > 0) {
+            return res.status(400).send('❌ Invalid offset. Must be between -9 and 0');
+        }
+    }
 
     if (trigger) {
-        res.status(200).json({ success: true, message: `Worker started. Memory-Optimized mode active. Full Fetch: ${forceFull}` });
-        runCatchupTask(forceFull); 
+        res.status(200).json({ 
+            success: true, 
+            message: `Worker started. Generating Day ${Math.abs(offset)} Catchup.xml (Offset: ${offset})`,
+            mode: updateMode ? 'UPDATE' : 'GENERATE',
+            offset: offset
+        });
+        
+        if (updateMode) {
+            runUpdateTask();
+        } else {
+            runGenerateTask(offset);
+        }
     } else {
-        await runCatchupTask(forceFull);
-        res.send(`✅ Catchup EPG update completed!`);
+        if (updateMode) {
+            await runUpdateTask();
+            res.send('✅ Update completed! Day rotation executed.');
+        } else {
+            await runGenerateTask(offset);
+            res.send(`✅ Day ${Math.abs(offset)} Catchup.xml generated successfully!`);
+        }
     }
 });
 
 // ==========================================
-// 🛠️ MEMORY-OPTIMIZED GENERATOR TASK
+// 🛠️ GENERATE TASK - FOR SPECIFIC OFFSET
 // ==========================================
-async function runCatchupTask(forceFull) {
+async function runGenerateTask(offset) {
     const tempDir = '/tmp/epg_temp';
-    const tempFile = path.join(tempDir, 'catchup.xml');
+    const tempFile = path.join(tempDir, `Day${Math.abs(offset)}${FILE_SUFFIX}`);
+    const targetFileName = `Day${Math.abs(offset)}${FILE_SUFFIX}`;
     
     try {
         // Create temp directory
@@ -53,22 +80,15 @@ async function runCatchupTask(forceFull) {
             fs.mkdirSync(tempDir, { recursive: true });
         }
         
-        console.log(`[EPG] Fetching new Channel List...`);
+        console.log(`[EPG] Fetching Channel List...`);
         const chReq = await fetch("https://raw.githubusercontent.com/Ayush8481Lab/Mm/refs/heads/main/AyushCatchup.json");
         const channelsData = await chReq.json();
         
         const validChannels = channelsData.filter(c => c.id);
         if (validChannels.length === 0) return console.log(`[EPG] No valid channels found.`);
 
-        const now = new Date();
-        const istTime = new Date(now.getTime() + 19800000); 
-        const todayStr = istTime.toISOString().substring(0,10).replace(/-/g, ''); 
-        const cutoffDate = new Date(istTime.getTime() - (8 * 86400000));
-        const cutoffStr = cutoffDate.toISOString().substring(0,10).replace(/-/g, '');
-
-        let offsetsToFetch = [0];
-        const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-
+        console.log(`[EPG] Generating Day ${Math.abs(offset)} Catchup.xml (Offset: ${offset})`);
+        
         // Create write stream
         const writeStream = fs.createWriteStream(tempFile, { flags: 'w' });
         
@@ -80,106 +100,30 @@ async function runCatchupTask(forceFull) {
             writeStream.write(`  <channel id="${c.id}">\n    <display-name>${escapeXml(c.name)}</display-name>\n  </channel>\n`);
         });
 
-        // ==========================================
-        // 📥 SMART CACHE FETCHER
-        // ==========================================
-        if (!forceFull && GITHUB_TOKEN) {
-            console.log(`[EPG] Attempting to load existing Catchup.xml to cache old data...`);
-            try {
-                const cacheRes = await fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${FILE_PATH}`, {
-                    headers: { 
-                        'Authorization': `Bearer ${GITHUB_TOKEN}`,
-                        'Accept': 'application/vnd.github.v3.raw',
-                        'Cache-Control': 'no-cache'
-                    }
-                });
-
-                if (cacheRes.ok) {
-                    let cacheXml = await cacheRes.text();
-                    const progBlocks = cacheXml.split('</programme>');
-                    let cachedCount = 0;
-                    
-                    for (let i = 0; i < progBlocks.length - 1; i++) {
-                        const block = progBlocks[i];
-                        const startIdx = block.indexOf('<programme ');
-                        if (startIdx === -1) continue;
-                        
-                        const fullBlock = block.substring(startIdx) + '</programme>';
-                        const dateMatch = fullBlock.match(/start="(\d{8})/);
-                        
-                        if (dateMatch) {
-                            const progStartDay = dateMatch[1];
-                            if (progStartDay < todayStr && progStartDay >= cutoffStr) {
-                                writeStream.write(fullBlock + '\n');
-                                cachedCount++;
-                            }
-                        }
-                    }
-                    console.log(`[EPG] ✅ Cache Loaded! Retained ${cachedCount} past programmes.`);
-                    // Clear cacheXml from memory
-                    cacheXml = null;
-                } else {
-                    console.log(`[EPG] File missing or failed. Forcing Full 9-Day Fetch.`);
-                    forceFull = true; 
-                }
-            } catch (err) {
-                console.log(`[EPG] Cache fetch error. Forcing Full 9-Day Fetch.`);
-                forceFull = true;
-            }
-        }
-
-        if (forceFull) {
-            offsetsToFetch = [0, -1, -2, -3, -4, -5, -6, -7, -8];
-            console.log(`[EPG] Proceeding with FULL FETCH of 9 Days (Offsets: 0 to -8)`);
-        }
-
-        const fetchChannelWithRetry = async (channelId, offset) => {
-            let jioUrl = `https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?channel_id=${channelId}&offset=${offset}`;
-            let retries = 2;
-            while (retries > 0) {
-                try {
-                    const epgRes = await fetch(jioUrl, { 
-                        headers: { 'User-Agent': 'okhttp/4.2.2', 'os': 'android', 'Accept': '*/*' },
-                        signal: AbortSignal.timeout(10000)
-                    });
-                    if (epgRes.ok) return await epgRes.json();
-                    if (epgRes.status === 404) return null;
-                } catch (err) {
-                    await new Promise(r => setTimeout(r, 300));
-                }
-                retries--;
-            }
-            return null;
-        };
-
-        // Process channels sequentially
+        // Fetch EPG data for the specific offset
         let programmeCount = 0;
         
         for (let i = 0; i < validChannels.length; i++) {
             const channel = validChannels[i];
             
             try {
-                // Fetch one day at a time
-                for (const offset of offsetsToFetch) {
-                    let data = await fetchChannelWithRetry(channel.id, offset);
-                    
-                    if (data && data.epg && data.epg.length > 0) {
-                        for (const show of data.epg) {
-                            const startXml = formatXmltvTime(show.startEpoch);
-                            const stopXml = formatXmltvTime(show.endEpoch);
-                            const titleXml = escapeXml(show.showname);
-                            const descXml = show.description ? `\n    <desc>${escapeXml(show.description)}</desc>` : "";
-                            const catXml = show.showCategory ? `\n    <category>${escapeXml(show.showCategory)}</category>` : "";
-                            
-                            writeStream.write(`  <programme start="${startXml}" stop="${stopXml}" channel="${channel.id}">\n    <title>${titleXml}</title>${descXml}${catXml}\n  </programme>\n`);
-                            programmeCount++;
-                        }
+                const data = await fetchChannelWithRetry(channel.id, offset);
+                
+                if (data && data.epg && data.epg.length > 0) {
+                    for (const show of data.epg) {
+                        const startXml = formatXmltvTime(show.startEpoch);
+                        const stopXml = formatXmltvTime(show.endEpoch);
+                        const titleXml = escapeXml(show.showname);
+                        const descXml = show.description ? `\n    <desc>${escapeXml(show.description)}</desc>` : "";
+                        const catXml = show.showCategory ? `\n    <category>${escapeXml(show.showCategory)}</category>` : "";
+                        
+                        writeStream.write(`  <programme start="${startXml}" stop="${stopXml}" channel="${channel.id}">\n    <title>${titleXml}</title>${descXml}${catXml}\n  </programme>\n`);
+                        programmeCount++;
                     }
-                    
-                    // Clear data reference
-                    data = null;
-                    await new Promise(r => setTimeout(r, 50));
                 }
+                
+                data = null;
+                await new Promise(r => setTimeout(r, 50));
                 
                 if ((i + 1) % 10 === 0 || i === validChannels.length - 1) {
                     console.log(`[EPG] Completed channel ${i + 1}/${validChannels.length}: ${channel.name} (Total programmes: ${programmeCount})`);
@@ -204,17 +148,21 @@ async function runCatchupTask(forceFull) {
         console.log(`[EPG] File size: ${(fs.statSync(tempFile).size / 1024 / 1024).toFixed(2)} MB`);
         
         // ==========================================
-        // ☁️ UPLOAD IN PARTS
+        // ☁️ UPLOAD TO GITHUB
         // ==========================================
-        await uploadFileInParts(tempFile, GITHUB_TOKEN);
+        const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+        if (GITHUB_TOKEN) {
+            await uploadFileToGitHub(tempFile, targetFileName, GITHUB_TOKEN);
+        } else {
+            console.error("❌ MISSING GITHUB TOKEN!");
+        }
         
         // Clean up temp file
         fs.unlinkSync(tempFile);
-        console.log(`[EPG] ✅ Task completed successfully!`);
+        console.log(`[EPG] ✅ Task completed successfully! Day ${Math.abs(offset)} generated.`);
 
     } catch (error) {
         console.error(`[EPG] FATAL ERROR:`, error.message);
-        // Clean up on error
         if (fs.existsSync(tempFile)) {
             fs.unlinkSync(tempFile);
         }
@@ -222,74 +170,79 @@ async function runCatchupTask(forceFull) {
 }
 
 // ==========================================
-// ☁️ UPLOAD FILE IN PARTS (FIXED)
+// 🔄 UPDATE TASK - ROTATE DAYS
 // ==========================================
-async function uploadFileInParts(filePath, token) {
-    if (!token) {
+async function runUpdateTask() {
+    const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+    if (!GITHUB_TOKEN) {
         console.error("❌ MISSING GITHUB TOKEN!");
         return;
     }
-
-    const fileSize = fs.statSync(filePath).size;
-    console.log(`[GitHub] Preparing to upload ${(fileSize / 1024 / 1024).toFixed(2)} MB file in parts...`);
-    
-    // Split into 5MB parts for base64 (5MB * 4/3 = 6.67MB base64)
-    const PART_SIZE = 5 * 1024 * 1024; // 5MB per part
-    const totalParts = Math.ceil(fileSize / PART_SIZE);
-    
-    console.log(`[GitHub] Splitting into ${totalParts} parts of 5MB each...`);
     
     try {
-        // Read the entire file in chunks and upload each part
-        const fileBuffer = fs.readFileSync(filePath);
+        console.log(`[UPDATE] Starting day rotation...`);
         
-        for (let i = 0; i < totalParts; i++) {
-            const start = i * PART_SIZE;
-            const end = Math.min(start + PART_SIZE, fileSize);
-            let partBuffer = fileBuffer.subarray(start, end); // Changed to let
+        // Step 1: Generate Day 0 (current day)
+        console.log(`[UPDATE] Generating Day 0 (current day)...`);
+        await runGenerateTask(0);
+        
+        // Step 2: Delete Day 9 file
+        console.log(`[UPDATE] Deleting Day9${FILE_SUFFIX}...`);
+        await deleteFileFromGitHub(`Day9${FILE_SUFFIX}`, GITHUB_TOKEN);
+        
+        // Step 3: Rename Day 8 to Day 9, Day 7 to Day 8, ..., Day 0 to Day 1
+        for (let i = 8; i >= 0; i--) {
+            const oldName = `Day${i}${FILE_SUFFIX}`;
+            const newName = `Day${i + 1}${FILE_SUFFIX}`;
             
-            // Upload each part as a separate file
-            const partFileName = `${FILE_PATH}.part${String(i + 1).padStart(3, '0')}`;
-            const partContent = partBuffer.toString('base64');
-            
-            console.log(`[GitHub] Uploading part ${i + 1}/${totalParts} (${(partBuffer.length / 1024 / 1024).toFixed(2)} MB)...`);
-            
-            const uploadResult = await uploadSingleFile(partFileName, partContent, token);
-            
-            if (uploadResult) {
-                console.log(`✅ Part ${i + 1} uploaded successfully`);
-            } else {
-                console.error(`❌ Failed to upload part ${i + 1}`);
-                break; // Stop if a part fails
-            }
-            
-            // Clear references
-            partBuffer = null;
-            
-            // Force garbage collection if available
-            if (global.gc) {
-                global.gc();
-            }
-            
-            // Small delay between parts
-            await new Promise(r => setTimeout(r, 500));
+            console.log(`[UPDATE] Renaming ${oldName} to ${newName}...`);
+            await renameFileOnGitHub(oldName, newName, GITHUB_TOKEN);
         }
         
-        console.log(`[GitHub] ✅ All parts uploaded successfully!`);
-        console.log(`[GitHub] Parts can be combined using: cat ${FILE_PATH}.part* > ${FILE_PATH}`);
+        console.log(`[UPDATE] ✅ Day rotation completed successfully!`);
         
     } catch (error) {
-        console.error(`❌ [GitHub] Upload Error:`, error.message);
+        console.error(`[UPDATE] Error during rotation:`, error.message);
     }
 }
 
 // ==========================================
-// ☁️ UPLOAD SINGLE FILE
+// 🛠️ FETCH CHANNEL WITH RETRY
 // ==========================================
-async function uploadSingleFile(fileName, contentBase64, token) {
-    const githubFileUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${fileName}`;
+async function fetchChannelWithRetry(channelId, offset) {
+    let jioUrl = `https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?channel_id=${channelId}&offset=${offset}`;
+    let retries = 2;
+    
+    while (retries > 0) {
+        try {
+            const epgRes = await fetch(jioUrl, { 
+                headers: { 'User-Agent': 'okhttp/4.2.2', 'os': 'android', 'Accept': '*/*' },
+                signal: AbortSignal.timeout(10000)
+            });
+            
+            if (epgRes.ok) return await epgRes.json();
+            if (epgRes.status === 404) return null;
+        } catch (err) {
+            await new Promise(r => setTimeout(r, 300));
+        }
+        retries--;
+    }
+    return null;
+}
+
+// ==========================================
+// ☁️ UPLOAD FILE TO GITHUB
+// ==========================================
+async function uploadFileToGitHub(filePath, fileName, token) {
+    const fileSize = fs.statSync(filePath).size;
+    console.log(`[GitHub] Uploading ${fileName} (${(fileSize / 1024 / 1024).toFixed(2)} MB)...`);
     
     try {
+        const fileContent = fs.readFileSync(filePath);
+        const base64Content = fileContent.toString('base64');
+        
+        const githubFileUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${fileName}`;
+        
         // Check if file exists
         let fileSha = undefined;
         try {
@@ -311,7 +264,7 @@ async function uploadSingleFile(fileName, contentBase64, token) {
         
         const requestBody = {
             message: `Update ${fileName} (${new Date().toISOString().substring(0, 10)})`,
-            content: contentBase64
+            content: base64Content
         };
         
         if (fileSha) {
@@ -329,34 +282,179 @@ async function uploadSingleFile(fileName, contentBase64, token) {
         });
         
         if (uploadResponse.ok) {
-            const responseData = await uploadResponse.json();
-            console.log(`✅ Uploaded ${fileName}`);
-            return { sha: responseData.content.sha };
+            console.log(`✅ Successfully uploaded ${fileName}`);
+            return true;
         } else {
             const errorData = await uploadResponse.json();
             console.error(`❌ Failed to upload ${fileName}:`, errorData.message);
-            return null;
+            return false;
         }
         
     } catch (error) {
         console.error(`❌ Error uploading ${fileName}:`, error.message);
-        return null;
+        return false;
     }
 }
 
 // ==========================================
-// 📥 COMBINE PARTS ENDPOINT
+// 🗑️ DELETE FILE FROM GITHUB
 // ==========================================
-app.get('/combine', async (req, res) => {
+async function deleteFileFromGitHub(fileName, token) {
+    const githubFileUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${fileName}`;
+    
+    try {
+        // Get file SHA
+        const checkExisting = await fetch(githubFileUrl, {
+            headers: { 
+                'Authorization': `Bearer ${token}`,
+                'Cache-Control': 'no-cache',
+                'User-Agent': 'Express-Catchup-Generator'
+            }
+        });
+        
+        if (!checkExisting.ok) {
+            console.log(`[GitHub] File ${fileName} not found, skipping deletion.`);
+            return true; // File doesn't exist, nothing to delete
+        }
+        
+        const fileData = await checkExisting.json();
+        
+        // Delete file
+        const deleteResponse = await fetch(githubFileUrl, {
+            method: 'DELETE',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Express-Catchup-Generator'
+            },
+            body: JSON.stringify({
+                message: `Delete ${fileName} (Day rotation)`,
+                sha: fileData.sha
+            })
+        });
+        
+        if (deleteResponse.ok) {
+            console.log(`✅ Successfully deleted ${fileName}`);
+            return true;
+        } else {
+            console.error(`❌ Failed to delete ${fileName}`);
+            return false;
+        }
+        
+    } catch (error) {
+        console.error(`❌ Error deleting ${fileName}:`, error.message);
+        return false;
+    }
+}
+
+// ==========================================
+// 📝 RENAME FILE ON GITHUB
+// ==========================================
+async function renameFileOnGitHub(oldName, newName, token) {
+    try {
+        // Download old file content
+        const downloadUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${oldName}`;
+        const downloadRes = await fetch(downloadUrl, {
+            headers: { 
+                'Authorization': `Bearer ${token}`,
+                'Cache-Control': 'no-cache',
+                'User-Agent': 'Express-Catchup-Generator'
+            }
+        });
+        
+        if (!downloadRes.ok) {
+            console.log(`[GitHub] File ${oldName} not found, skipping rename.`);
+            return false;
+        }
+        
+        const fileData = await downloadRes.json();
+        const content = fileData.content; // Already base64 encoded
+        
+        // Create new file with old content
+        const createUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${newName}`;
+        
+        // Check if new file already exists
+        let newFileSha = undefined;
+        try {
+            const checkNew = await fetch(createUrl, {
+                headers: { 
+                    'Authorization': `Bearer ${token}`,
+                    'Cache-Control': 'no-cache',
+                    'User-Agent': 'Express-Catchup-Generator'
+                }
+            });
+            
+            if (checkNew.ok) {
+                const newFileData = await checkNew.json();
+                newFileSha = newFileData.sha;
+            }
+        } catch (e) {
+            // New file doesn't exist
+        }
+        
+        const createBody = {
+            message: `Rename ${oldName} to ${newName}`,
+            content: content
+        };
+        
+        if (newFileSha) {
+            createBody.sha = newFileSha;
+        }
+        
+        const createRes = await fetch(createUrl, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Express-Catchup-Generator'
+            },
+            body: JSON.stringify(createBody)
+        });
+        
+        if (!createRes.ok) {
+            console.error(`❌ Failed to create ${newName} during rename`);
+            return false;
+        }
+        
+        // Delete old file
+        const deleteUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${oldName}`;
+        const deleteRes = await fetch(deleteUrl, {
+            method: 'DELETE',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Express-Catchup-Generator'
+            },
+            body: JSON.stringify({
+                message: `Delete ${oldName} after rename to ${newName}`,
+                sha: fileData.sha
+            })
+        });
+        
+        if (deleteRes.ok) {
+            console.log(`✅ Successfully renamed ${oldName} to ${newName}`);
+            return true;
+        } else {
+            console.error(`❌ Failed to delete ${oldName} after creating ${newName}`);
+            return false;
+        }
+        
+    } catch (error) {
+        console.error(`❌ Error renaming ${oldName}:`, error.message);
+        return false;
+    }
+}
+
+// ==========================================
+// 📋 LIST ALL DAY FILES
+// ==========================================
+app.get('/list-days', async (req, res) => {
     const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
     if (!GITHUB_TOKEN) {
         return res.status(500).send('Missing GitHub token');
     }
     
     try {
-        console.log(`[GitHub] Starting to combine parts...`);
-        
-        // List all part files
         const listUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/`;
         const listRes = await fetch(listUrl, {
             headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}` }
@@ -367,94 +465,26 @@ app.get('/combine', async (req, res) => {
         }
         
         const files = await listRes.json();
-        const partFiles = files
-            .filter(f => f.name.startsWith(`${FILE_PATH}.part`))
+        const dayFiles = files
+            .filter(f => f.name.includes(FILE_SUFFIX) && f.name.startsWith(FILE_PREFIX))
             .sort((a, b) => a.name.localeCompare(b.name));
         
-        if (partFiles.length === 0) {
-            return res.status(404).send('No part files found');
-        }
+        const fileList = dayFiles.map(f => ({
+            name: f.name,
+            size: (f.size / 1024 / 1024).toFixed(2) + ' MB',
+            download: f.download_url
+        }));
         
-        console.log(`[GitHub] Found ${partFiles.length} part files`);
-        
-        // Download and combine all parts
-        let combinedContent = '';
-        
-        for (const part of partFiles) {
-            console.log(`[GitHub] Downloading ${part.name}...`);
-            const downloadRes = await fetch(part.download_url, {
-                headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}` }
-            });
-            
-            if (downloadRes.ok) {
-                const partContent = await downloadRes.text();
-                combinedContent += partContent;
-            }
-        }
-        
-        // Upload combined file
-        const finalContent = Buffer.from(combinedContent, 'utf-8').toString('base64');
-        
-        console.log(`[GitHub] Uploading combined file (${(combinedContent.length / 1024 / 1024).toFixed(2)} MB)...`);
-        
-        // Get current file SHA if exists
-        let fileSha = undefined;
-        const checkUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${FILE_PATH}`;
-        const checkRes = await fetch(checkUrl, {
-            headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}` }
+        res.json({
+            total: fileList.length,
+            files: fileList
         });
-        
-        if (checkRes.ok) {
-            const fileData = await checkRes.json();
-            fileSha = fileData.sha;
-        }
-        
-        const requestBody = {
-            message: `Combine EPG parts (${new Date().toISOString().substring(0, 10)})`,
-            content: finalContent
-        };
-        
-        if (fileSha) {
-            requestBody.sha = fileSha;
-        }
-        
-        const uploadRes = await fetch(checkUrl, {
-            method: 'PUT',
-            headers: {
-                'Authorization': `Bearer ${GITHUB_TOKEN}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Express-Catchup-Generator'
-            },
-            body: JSON.stringify(requestBody)
-        });
-        
-        if (uploadRes.ok) {
-            // Delete part files
-            for (const part of partFiles) {
-                await fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${part.name}`, {
-                    method: 'DELETE',
-                    headers: {
-                        'Authorization': `Bearer ${GITHUB_TOKEN}`,
-                        'Content-Type': 'application/json',
-                        'User-Agent': 'Express-Catchup-Generator'
-                    },
-                    body: JSON.stringify({
-                        message: `Delete part file ${part.name}`,
-                        sha: part.sha
-                    })
-                });
-            }
-            
-            res.send('✅ Parts combined and uploaded successfully!');
-        } else {
-            res.status(500).send('Failed to upload combined file');
-        }
         
     } catch (error) {
-        console.error('❌ Combine error:', error);
-        res.status(500).send('Error combining parts');
+        console.error('Error listing files:', error);
+        res.status(500).send('Error listing files');
     }
 });
 
-app.get('/', (req, res) => res.send("Catchup EPG Scraper is Running!"));
+app.get('/', (req, res) => res.send("Catchup EPG Scraper is Running! Use /generate?id=-9 to 0 or /generate?update=true"));
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
