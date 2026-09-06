@@ -26,30 +26,9 @@ const formatXmltvTime = (epoch) => {
 };
 
 // ==========================================
-// 🔒 TASK LOCK - PREVENT CONCURRENT OPERATIONS
+// 🔒 SIMPLE TASK TRACKING (NO LOCK - ALLOW CONCURRENT)
 // ==========================================
-let isTaskRunning = false;
-let currentTask = null;
-
-async function withTaskLock(taskName, taskFunction) {
-    if (isTaskRunning) {
-        console.log(`[LOCK] Task "${currentTask}" is already running. Rejecting new task "${taskName}".`);
-        return false;
-    }
-    
-    isTaskRunning = true;
-    currentTask = taskName;
-    console.log(`[LOCK] Starting task: ${taskName}`);
-    
-    try {
-        await taskFunction();
-        return true;
-    } finally {
-        console.log(`[LOCK] Task "${taskName}" completed.`);
-        isTaskRunning = false;
-        currentTask = null;
-    }
-}
+let activeTasks = new Map();
 
 // ==========================================
 // 🚀 API ENDPOINT
@@ -61,15 +40,6 @@ app.get('/generate', async (req, res) => {
 
     // PRIORITY: Check update mode first
     if (updateMode) {
-        // Check if any task is running
-        if (isTaskRunning) {
-            return res.status(409).json({
-                success: false,
-                message: `Task "${currentTask}" is already running. Please wait.`,
-                currentTask: currentTask
-            });
-        }
-        
         // Return JSON immediately
         res.status(200).json({
             success: true,
@@ -78,8 +48,8 @@ app.get('/generate', async (req, res) => {
             timestamp: new Date().toISOString()
         });
         
-        // Run update task asynchronously with lock
-        withTaskLock('UPDATE_ROTATION', runUpdateTask);
+        // Run update task asynchronously
+        runUpdateTask();
         return;
     }
 
@@ -90,15 +60,6 @@ app.get('/generate', async (req, res) => {
         if (isNaN(offset) || offset < -9 || offset > 0) {
             return res.status(400).send('❌ Invalid offset. Must be between -9 and 0');
         }
-    }
-
-    // Check if any task is running
-    if (isTaskRunning) {
-        return res.status(409).json({
-            success: false,
-            message: `Task "${currentTask}" is already running. Please wait.`,
-            currentTask: currentTask
-        });
     }
 
     const taskName = `GENERATE_DAY_${Math.abs(offset)}`;
@@ -112,13 +73,15 @@ app.get('/generate', async (req, res) => {
             timestamp: new Date().toISOString()
         });
         
-        withTaskLock(taskName, () => runGenerateTask(offset));
+        // Run generate task asynchronously
+        runGenerateTask(offset);
     } else {
-        const success = await withTaskLock(taskName, () => runGenerateTask(offset));
+        // Run generate task synchronously
+        const success = await runGenerateTask(offset);
         if (success) {
             res.send(`✅ Day ${Math.abs(offset)} Catchup.xml generated successfully!`);
         } else {
-            res.status(500).send('❌ Failed to generate. Task may already be running.');
+            res.status(500).send('❌ Failed to generate.');
         }
     }
 });
@@ -151,7 +114,7 @@ async function runGenerateTask(offset) {
             return false;
         }
 
-        console.log(`[GENERATE] Processing ${validChannels.length} channels with 200 concurrent requests...`);
+        console.log(`[GENERATE] Processing ${validChannels.length} channels...`);
         
         // Process channels in batches of 200
         const BATCH_SIZE = 200;
@@ -251,7 +214,11 @@ async function runGenerateTask(offset) {
         // Clean up
         allProgrammes = [];
         if (fs.existsSync(tempFile)) {
-            fs.unlinkSync(tempFile);
+            try {
+                fs.unlinkSync(tempFile);
+            } catch (e) {
+                console.log(`[GENERATE] Could not delete temp file: ${e.message}`);
+            }
         }
         
         console.log(`[GENERATE] ✅ Task completed successfully!`);
@@ -263,7 +230,7 @@ async function runGenerateTask(offset) {
             try {
                 fs.unlinkSync(tempFile);
             } catch (e) {
-                // Ignore unlink errors
+                // Ignore
             }
         }
         return false;
@@ -334,7 +301,11 @@ async function runUpdateTask() {
             await uploadFileToGitHub(fileInfo.localPath, newFileName, GITHUB_TOKEN);
             
             if (fs.existsSync(fileInfo.localPath)) {
-                fs.unlinkSync(fileInfo.localPath);
+                try {
+                    fs.unlinkSync(fileInfo.localPath);
+                } catch (e) {
+                    // Ignore
+                }
             }
             
             await new Promise(r => setTimeout(r, 500));
@@ -350,13 +321,21 @@ async function runUpdateTask() {
         
         // Clean up
         if (fs.existsSync(tempDir)) {
-            fs.rmSync(tempDir, { recursive: true, force: true });
+            try {
+                fs.rmSync(tempDir, { recursive: true, force: true });
+            } catch (e) {
+                // Ignore
+            }
         }
         
     } catch (error) {
         console.error(`[UPDATE] Error:`, error.message);
         if (fs.existsSync(tempDir)) {
-            fs.rmSync(tempDir, { recursive: true, force: true });
+            try {
+                fs.rmSync(tempDir, { recursive: true, force: true });
+            } catch (e) {
+                // Ignore
+            }
         }
     }
 }
@@ -390,7 +369,7 @@ async function fetchChannelWithRetry(channelId, offset) {
 }
 
 // ==========================================
-// ☁️ UPLOAD FILE TO GITHUB (SIMPLIFIED - NO SHA CHECK)
+// ☁️ UPLOAD FILE TO GITHUB
 // ==========================================
 async function uploadFileToGitHub(filePath, fileName, token) {
     try {
