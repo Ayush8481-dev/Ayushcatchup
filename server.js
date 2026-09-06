@@ -88,8 +88,86 @@ async function runGenerateTask(offset) {
         if (validChannels.length === 0) return console.log(`[EPG] No valid channels found.`);
 
         console.log(`[EPG] Generating Day ${Math.abs(offset)} Catchup.xml (Offset: ${offset})`);
+        console.log(`[EPG] Processing ${validChannels.length} channels with 200 concurrent requests...`);
         
-        // Create write stream
+        // Process channels in batches of 200
+        const BATCH_SIZE = 200;
+        const channelBatches = [];
+        
+        for (let i = 0; i < validChannels.length; i += BATCH_SIZE) {
+            channelBatches.push(validChannels.slice(i, i + BATCH_SIZE));
+        }
+        
+        console.log(`[EPG] Total batches: ${channelBatches.length} (${BATCH_SIZE} channels per batch)`);
+        
+        // Store all programmes in memory temporarily (batch processing)
+        let allProgrammes = [];
+        let totalProgrammeCount = 0;
+        
+        for (let batchIndex = 0; batchIndex < channelBatches.length; batchIndex++) {
+            const batch = channelBatches[batchIndex];
+            console.log(`[EPG] Processing batch ${batchIndex + 1}/${channelBatches.length} (${batch.length} channels)...`);
+            
+            // Process all channels in this batch concurrently
+            const batchResults = await Promise.all(
+                batch.map(async (channel) => {
+                    try {
+                        const data = await fetchChannelWithRetry(channel.id, offset);
+                        
+                        if (data && data.epg && data.epg.length > 0) {
+                            const programmes = data.epg.map(show => {
+                                const startXml = formatXmltvTime(show.startEpoch);
+                                const stopXml = formatXmltvTime(show.endEpoch);
+                                const titleXml = escapeXml(show.showname);
+                                const descXml = show.description ? `\n    <desc>${escapeXml(show.description)}</desc>` : "";
+                                const catXml = show.showCategory ? `\n    <category>${escapeXml(show.showCategory)}</category>` : "";
+                                
+                                return `  <programme start="${startXml}" stop="${stopXml}" channel="${channel.id}">\n    <title>${titleXml}</title>${descXml}${catXml}\n  </programme>`;
+                            });
+                            
+                            return {
+                                channel: channel,
+                                programmes: programmes
+                            };
+                        }
+                        
+                        return {
+                            channel: channel,
+                            programmes: []
+                        };
+                        
+                    } catch (err) {
+                        return {
+                            channel: channel,
+                            programmes: [],
+                            error: err.message
+                        };
+                    }
+                })
+            );
+            
+            // Process batch results
+            for (const result of batchResults) {
+                if (result.programmes && result.programmes.length > 0) {
+                    allProgrammes.push(...result.programmes);
+                    totalProgrammeCount += result.programmes.length;
+                }
+                
+                if (result.error) {
+                    console.error(`[EPG] Error processing channel ${result.channel.name}: ${result.error}`);
+                }
+            }
+            
+            console.log(`[EPG] Batch ${batchIndex + 1} completed. Total programmes so far: ${totalProgrammeCount}`);
+            
+            // Clear references to help garbage collection
+            batchResults.length = 0;
+        }
+        
+        console.log(`[EPG] All batches completed. Total programmes: ${totalProgrammeCount}`);
+        
+        // Write all programmes to file
+        console.log(`[EPG] Writing XML to file...`);
         const writeStream = fs.createWriteStream(tempFile, { flags: 'w' });
         
         // Write XML header
@@ -99,42 +177,13 @@ async function runGenerateTask(offset) {
         validChannels.forEach(c => {
             writeStream.write(`  <channel id="${c.id}">\n    <display-name>${escapeXml(c.name)}</display-name>\n  </channel>\n`);
         });
-
-        // Fetch EPG data for the specific offset
-        let programmeCount = 0;
         
-        for (let i = 0; i < validChannels.length; i++) {
-            const channel = validChannels[i];
-            
-            try {
-                const data = await fetchChannelWithRetry(channel.id, offset);
-                
-                if (data && data.epg && data.epg.length > 0) {
-                    for (const show of data.epg) {
-                        const startXml = formatXmltvTime(show.startEpoch);
-                        const stopXml = formatXmltvTime(show.endEpoch);
-                        const titleXml = escapeXml(show.showname);
-                        const descXml = show.description ? `\n    <desc>${escapeXml(show.description)}</desc>` : "";
-                        const catXml = show.showCategory ? `\n    <category>${escapeXml(show.showCategory)}</category>` : "";
-                        
-                        writeStream.write(`  <programme start="${startXml}" stop="${stopXml}" channel="${channel.id}">\n    <title>${titleXml}</title>${descXml}${catXml}\n  </programme>\n`);
-                        programmeCount++;
-                    }
-                }
-                
-                data = null;
-                await new Promise(r => setTimeout(r, 50));
-                
-                if ((i + 1) % 10 === 0 || i === validChannels.length - 1) {
-                    console.log(`[EPG] Completed channel ${i + 1}/${validChannels.length}: ${channel.name} (Total programmes: ${programmeCount})`);
-                }
-                
-            } catch (err) {
-                console.error(`[EPG] Error processing channel ${channel.name}:`, err.message);
-            }
-        }
-
-        // Close the write stream
+        // Write programmes
+        allProgrammes.forEach(programme => {
+            writeStream.write(programme + '\n');
+        });
+        
+        // Close XML
         writeStream.write(`</tv>`);
         writeStream.end();
         
@@ -144,7 +193,7 @@ async function runGenerateTask(offset) {
             writeStream.on('error', reject);
         });
         
-        console.log(`[EPG] ✅ XML generated! Total programmes: ${programmeCount}`);
+        console.log(`[EPG] ✅ XML generated! Total programmes: ${totalProgrammeCount}`);
         console.log(`[EPG] File size: ${(fs.statSync(tempFile).size / 1024 / 1024).toFixed(2)} MB`);
         
         // ==========================================
@@ -157,7 +206,8 @@ async function runGenerateTask(offset) {
             console.error("❌ MISSING GITHUB TOKEN!");
         }
         
-        // Clean up temp file
+        // Clean up
+        allProgrammes = [];
         fs.unlinkSync(tempFile);
         console.log(`[EPG] ✅ Task completed successfully! Day ${Math.abs(offset)} generated.`);
 
@@ -220,9 +270,14 @@ async function fetchChannelWithRetry(channelId, offset) {
                 signal: AbortSignal.timeout(10000)
             });
             
-            if (epgRes.ok) return await epgRes.json();
-            if (epgRes.status === 404) return null;
+            if (epgRes.ok) {
+                return await epgRes.json();
+            }
+            if (epgRes.status === 404) {
+                return null;
+            }
         } catch (err) {
+            // Wait before retry
             await new Promise(r => setTimeout(r, 300));
         }
         retries--;
