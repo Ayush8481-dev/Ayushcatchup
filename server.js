@@ -42,27 +42,33 @@ app.get('/generate', async (req, res) => {
         }
     }
 
-    if (trigger) {
+    if (updateMode) {
+        // Update mode - always return JSON immediately
+        res.status(200).json({
+            success: true,
+            message: "Update started! Day rotation and Day 0 generation in progress...",
+            mode: 'UPDATE',
+            timestamp: new Date().toISOString()
+        });
+        
+        // Run update task asynchronously
+        runUpdateTask();
+    } else if (trigger) {
+        // Generate mode with trigger - return JSON immediately
         res.status(200).json({ 
             success: true, 
             message: `Worker started. Generating Day ${Math.abs(offset)} Catchup.xml (Offset: ${offset})`,
-            mode: updateMode ? 'UPDATE' : 'GENERATE',
-            offset: offset
+            mode: 'GENERATE',
+            offset: offset,
+            timestamp: new Date().toISOString()
         });
         
-        if (updateMode) {
-            runUpdateTask();
-        } else {
-            runGenerateTask(offset);
-        }
+        // Run generate task asynchronously
+        runGenerateTask(offset);
     } else {
-        if (updateMode) {
-            await runUpdateTask();
-            res.send('✅ Update completed! Day rotation executed.');
-        } else {
-            await runGenerateTask(offset);
-            res.send(`✅ Day ${Math.abs(offset)} Catchup.xml generated successfully!`);
-        }
+        // Generate mode without trigger - wait for completion
+        await runGenerateTask(offset);
+        res.send(`✅ Day ${Math.abs(offset)} Catchup.xml generated successfully!`);
     }
 });
 
@@ -85,7 +91,10 @@ async function runGenerateTask(offset) {
         const channelsData = await chReq.json();
         
         const validChannels = channelsData.filter(c => c.id);
-        if (validChannels.length === 0) return console.log(`[EPG] No valid channels found.`);
+        if (validChannels.length === 0) {
+            console.log(`[EPG] No valid channels found.`);
+            return;
+        }
 
         console.log(`[EPG] Generating Day ${Math.abs(offset)} Catchup.xml (Offset: ${offset})`);
         console.log(`[EPG] Processing ${validChannels.length} channels with 200 concurrent requests...`);
@@ -210,17 +219,20 @@ async function runGenerateTask(offset) {
         allProgrammes = [];
         fs.unlinkSync(tempFile);
         console.log(`[EPG] ✅ Task completed successfully! Day ${Math.abs(offset)} generated.`);
+        
+        return true;
 
     } catch (error) {
         console.error(`[EPG] FATAL ERROR:`, error.message);
         if (fs.existsSync(tempFile)) {
             fs.unlinkSync(tempFile);
         }
+        return false;
     }
 }
 
 // ==========================================
-// 🔄 UPDATE TASK - ROTATE DAYS
+// 🔄 UPDATE TASK - ROTATE DAYS (FIXED ORDER)
 // ==========================================
 async function runUpdateTask() {
     const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -230,26 +242,34 @@ async function runUpdateTask() {
     }
     
     try {
+        console.log(`[UPDATE] ========================================`);
         console.log(`[UPDATE] Starting day rotation...`);
+        console.log(`[UPDATE] ========================================`);
         
-        // Step 1: Generate Day 0 (current day)
-        console.log(`[UPDATE] Generating Day 0 (current day)...`);
-        await runGenerateTask(0);
-        
-        // Step 2: Delete Day 9 file
-        console.log(`[UPDATE] Deleting Day9${FILE_SUFFIX}...`);
+        // Step 1: Delete Day 9 file (oldest)
+        console.log(`[UPDATE] Step 1: Deleting Day9${FILE_SUFFIX}...`);
         await deleteFileFromGitHub(`Day9${FILE_SUFFIX}`, GITHUB_TOKEN);
         
-        // Step 3: Rename Day 8 to Day 9, Day 7 to Day 8, ..., Day 0 to Day 1
+        // Step 2: Rename Day 8 to Day 9, Day 7 to Day 8, ..., Day 0 to Day 1
+        console.log(`[UPDATE] Step 2: Rotating files...`);
         for (let i = 8; i >= 0; i--) {
             const oldName = `Day${i}${FILE_SUFFIX}`;
             const newName = `Day${i + 1}${FILE_SUFFIX}`;
             
             console.log(`[UPDATE] Renaming ${oldName} to ${newName}...`);
             await renameFileOnGitHub(oldName, newName, GITHUB_TOKEN);
+            
+            // Small delay to avoid rate limiting
+            await new Promise(r => setTimeout(r, 500));
         }
         
+        // Step 3: Generate and upload Day 0 (current day)
+        console.log(`[UPDATE] Step 3: Generating Day 0 (current day)...`);
+        await runGenerateTask(0);
+        
+        console.log(`[UPDATE] ========================================`);
         console.log(`[UPDATE] ✅ Day rotation completed successfully!`);
+        console.log(`[UPDATE] ========================================`);
         
     } catch (error) {
         console.error(`[UPDATE] Error during rotation:`, error.message);
@@ -260,7 +280,7 @@ async function runUpdateTask() {
 // 🛠️ FETCH CHANNEL WITH RETRY
 // ==========================================
 async function fetchChannelWithRetry(channelId, offset) {
-    let jioUrl = `https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?channel_id=${channelId}&offset=${offset}`;
+    const jioUrl = `https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get?channel_id=${channelId}&offset=${offset}`;
     let retries = 2;
     
     while (retries > 0) {
