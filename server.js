@@ -26,14 +26,29 @@ const formatXmltvTime = (epoch) => {
 };
 
 // ==========================================
-// 🚀 API ENDPOINT - GENERATE SPECIFIC DAY OFFSET
+// 🚀 API ENDPOINT
 // ==========================================
 app.get('/generate', async (req, res) => {
     const trigger = req.query.trigger === 'true';
     const updateMode = req.query.update === 'true';
     const offsetParam = req.query.id;
 
-    // Parse offset (default to 0 if not provided or invalid)
+    // PRIORITY: Check update mode first
+    if (updateMode) {
+        // Return JSON immediately
+        res.status(200).json({
+            success: true,
+            message: "Update rotation started! Will download, rotate, delete, and upload files. Finally generating new Day 0.",
+            mode: 'UPDATE',
+            timestamp: new Date().toISOString()
+        });
+        
+        // Run update task asynchronously (includes Day 0 generation)
+        runUpdateTask();
+        return; // EXIT - don't process anything else
+    }
+
+    // If not update mode, handle regular generation
     let offset = 0;
     if (offsetParam !== undefined && offsetParam !== null) {
         offset = parseInt(offsetParam);
@@ -42,19 +57,7 @@ app.get('/generate', async (req, res) => {
         }
     }
 
-    if (updateMode) {
-        // Update mode - always return JSON immediately
-        res.status(200).json({
-            success: true,
-            message: "Update started! Day rotation and Day 0 generation in progress...",
-            mode: 'UPDATE',
-            timestamp: new Date().toISOString()
-        });
-        
-        // Run update task asynchronously
-        runUpdateTask();
-    } else if (trigger) {
-        // Generate mode with trigger - return JSON immediately
+    if (trigger) {
         res.status(200).json({ 
             success: true, 
             message: `Worker started. Generating Day ${Math.abs(offset)} Catchup.xml (Offset: ${offset})`,
@@ -63,10 +66,8 @@ app.get('/generate', async (req, res) => {
             timestamp: new Date().toISOString()
         });
         
-        // Run generate task asynchronously
         runGenerateTask(offset);
     } else {
-        // Generate mode without trigger - wait for completion
         await runGenerateTask(offset);
         res.send(`✅ Day ${Math.abs(offset)} Catchup.xml generated successfully!`);
     }
@@ -86,18 +87,21 @@ async function runGenerateTask(offset) {
             fs.mkdirSync(tempDir, { recursive: true });
         }
         
-        console.log(`[EPG] Fetching Channel List...`);
+        console.log(`[GENERATE] ========================================`);
+        console.log(`[GENERATE] Starting Day ${Math.abs(offset)} generation (Offset: ${offset})`);
+        console.log(`[GENERATE] ========================================`);
+        
+        console.log(`[GENERATE] Fetching Channel List...`);
         const chReq = await fetch("https://raw.githubusercontent.com/Ayush8481Lab/Mm/refs/heads/main/AyushCatchup.json");
         const channelsData = await chReq.json();
         
         const validChannels = channelsData.filter(c => c.id);
         if (validChannels.length === 0) {
-            console.log(`[EPG] No valid channels found.`);
+            console.log(`[GENERATE] No valid channels found.`);
             return false;
         }
 
-        console.log(`[EPG] Generating Day ${Math.abs(offset)} Catchup.xml (Offset: ${offset})`);
-        console.log(`[EPG] Processing ${validChannels.length} channels with 200 concurrent requests...`);
+        console.log(`[GENERATE] Processing ${validChannels.length} channels with 200 concurrent requests...`);
         
         // Process channels in batches of 200
         const BATCH_SIZE = 200;
@@ -107,7 +111,7 @@ async function runGenerateTask(offset) {
             channelBatches.push(validChannels.slice(i, i + BATCH_SIZE));
         }
         
-        console.log(`[EPG] Total batches: ${channelBatches.length} (${BATCH_SIZE} channels per batch)`);
+        console.log(`[GENERATE] Total batches: ${channelBatches.length} (${BATCH_SIZE} channels per batch)`);
         
         // Store all programmes in memory temporarily (batch processing)
         let allProgrammes = [];
@@ -115,7 +119,7 @@ async function runGenerateTask(offset) {
         
         for (let batchIndex = 0; batchIndex < channelBatches.length; batchIndex++) {
             const batch = channelBatches[batchIndex];
-            console.log(`[EPG] Processing batch ${batchIndex + 1}/${channelBatches.length} (${batch.length} channels)...`);
+            console.log(`[GENERATE] Processing batch ${batchIndex + 1}/${channelBatches.length} (${batch.length} channels)...`);
             
             // Process all channels in this batch concurrently
             const batchResults = await Promise.all(
@@ -163,20 +167,20 @@ async function runGenerateTask(offset) {
                 }
                 
                 if (result.error) {
-                    console.error(`[EPG] Error processing channel ${result.channel.name}: ${result.error}`);
+                    console.error(`[GENERATE] Error processing channel ${result.channel.name}: ${result.error}`);
                 }
             }
             
-            console.log(`[EPG] Batch ${batchIndex + 1} completed. Total programmes so far: ${totalProgrammeCount}`);
+            console.log(`[GENERATE] Batch ${batchIndex + 1} completed. Total programmes so far: ${totalProgrammeCount}`);
             
             // Clear references to help garbage collection
             batchResults.length = 0;
         }
         
-        console.log(`[EPG] All batches completed. Total programmes: ${totalProgrammeCount}`);
+        console.log(`[GENERATE] All batches completed. Total programmes: ${totalProgrammeCount}`);
         
         // Write all programmes to file
-        console.log(`[EPG] Writing XML to file...`);
+        console.log(`[GENERATE] Writing XML to file...`);
         const writeStream = fs.createWriteStream(tempFile, { flags: 'w' });
         
         // Write XML header
@@ -202,28 +206,33 @@ async function runGenerateTask(offset) {
             writeStream.on('error', reject);
         });
         
-        console.log(`[EPG] ✅ XML generated! Total programmes: ${totalProgrammeCount}`);
-        console.log(`[EPG] File size: ${(fs.statSync(tempFile).size / 1024 / 1024).toFixed(2)} MB`);
+        console.log(`[GENERATE] ✅ XML generated! Total programmes: ${totalProgrammeCount}`);
+        console.log(`[GENERATE] File size: ${(fs.statSync(tempFile).size / 1024 / 1024).toFixed(2)} MB`);
         
         // ==========================================
         // ☁️ UPLOAD TO GITHUB
         // ==========================================
         const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
         if (GITHUB_TOKEN) {
-            await uploadFileToGitHub(tempFile, targetFileName, GITHUB_TOKEN);
+            const uploadSuccess = await uploadFileToGitHub(tempFile, targetFileName, GITHUB_TOKEN);
+            if (uploadSuccess) {
+                console.log(`[GENERATE] ✅ Day ${Math.abs(offset)} uploaded successfully!`);
+            }
         } else {
-            console.error("❌ MISSING GITHUB TOKEN!");
+            console.error("[GENERATE] ❌ MISSING GITHUB TOKEN!");
         }
         
         // Clean up
         allProgrammes = [];
         fs.unlinkSync(tempFile);
-        console.log(`[EPG] ✅ Task completed successfully! Day ${Math.abs(offset)} generated.`);
+        console.log(`[GENERATE] ========================================`);
+        console.log(`[GENERATE] ✅ Task completed successfully!`);
+        console.log(`[GENERATE] ========================================`);
         
         return true;
 
     } catch (error) {
-        console.error(`[EPG] FATAL ERROR:`, error.message);
+        console.error(`[GENERATE] FATAL ERROR:`, error.message);
         if (fs.existsSync(tempFile)) {
             fs.unlinkSync(tempFile);
         }
@@ -232,7 +241,7 @@ async function runGenerateTask(offset) {
 }
 
 // ==========================================
-// 🔄 UPDATE TASK - ROTATE DAYS (LOCAL DOWNLOAD/UPLOAD METHOD)
+// 🔄 UPDATE TASK - ROTATE DAYS
 // ==========================================
 async function runUpdateTask() {
     const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -245,7 +254,7 @@ async function runUpdateTask() {
     
     try {
         console.log(`[UPDATE] ========================================`);
-        console.log(`[UPDATE] Starting day rotation...`);
+        console.log(`[UPDATE] Starting full day rotation process`);
         console.log(`[UPDATE] ========================================`);
         
         // Create temp directory for rotation
@@ -270,7 +279,6 @@ async function runUpdateTask() {
                 console.log(`[UPDATE] ${fileName} not found, skipping.`);
             }
             
-            // Small delay to avoid rate limiting
             await new Promise(r => setTimeout(r, 500));
         }
         
@@ -293,20 +301,29 @@ async function runUpdateTask() {
             const newFileName = `Day${newDay}${FILE_SUFFIX}`;
             
             console.log(`[UPDATE] Uploading ${fileInfo.fileName} as ${newFileName}...`);
-            await uploadFileToGitHub(fileInfo.localPath, newFileName, GITHUB_TOKEN);
+            const uploadSuccess = await uploadFileToGitHub(fileInfo.localPath, newFileName, GITHUB_TOKEN);
+            
+            if (uploadSuccess) {
+                console.log(`[UPDATE] ✅ ${newFileName} uploaded successfully`);
+            }
             
             // Clean up local file
             fs.unlinkSync(fileInfo.localPath);
             
-            // Small delay to avoid rate limiting
             await new Promise(r => setTimeout(r, 500));
         }
         
         console.log(`[UPDATE] Rotated files uploaded successfully.`);
         
         // Step 4: Generate and upload new Day 0
-        console.log(`[UPDATE] Step 4: Generating new Day 0...`);
-        await runGenerateTask(0);
+        console.log(`[UPDATE] Step 4: Generating new Day 0 (current day)...`);
+        const day0Success = await runGenerateTask(0);
+        
+        if (day0Success) {
+            console.log(`[UPDATE] ✅ New Day 0 generated and uploaded successfully!`);
+        } else {
+            console.error(`[UPDATE] ❌ Failed to generate Day 0!`);
+        }
         
         console.log(`[UPDATE] ========================================`);
         console.log(`[UPDATE] ✅ Day rotation completed successfully!`);
@@ -348,7 +365,6 @@ async function fetchChannelWithRetry(channelId, offset) {
                 return null;
             }
         } catch (err) {
-            // Wait before retry
             await new Promise(r => setTimeout(r, 300));
         }
         retries--;
@@ -369,10 +385,34 @@ async function uploadFileToGitHub(filePath, fileName, token) {
         
         const githubFileUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${fileName}`;
         
+        // Check if file exists to get SHA
+        let fileSha = undefined;
+        try {
+            const checkExisting = await fetch(githubFileUrl, {
+                headers: { 
+                    'Authorization': `Bearer ${token}`,
+                    'Cache-Control': 'no-cache',
+                    'User-Agent': 'Express-Catchup-Generator'
+                }
+            });
+            
+            if (checkExisting.ok) {
+                const existingFileData = await checkExisting.json();
+                fileSha = existingFileData.sha;
+                console.log(`[GitHub] File exists, updating...`);
+            }
+        } catch (e) {
+            // File doesn't exist, create new
+        }
+        
         const requestBody = {
             message: `Update ${fileName} (${new Date().toISOString().substring(0, 10)})`,
             content: base64Content
         };
+        
+        if (fileSha) {
+            requestBody.sha = fileSha;
+        }
         
         const uploadResponse = await fetch(githubFileUrl, {
             method: 'PUT',
@@ -455,7 +495,7 @@ async function deleteFileFromGitHub(fileName, token) {
         
         if (!checkExisting.ok) {
             console.log(`[GitHub] File ${fileName} not found, skipping deletion.`);
-            return true; // File doesn't exist, nothing to delete
+            return true;
         }
         
         const fileData = await checkExisting.json();
